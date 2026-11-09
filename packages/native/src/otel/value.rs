@@ -16,8 +16,18 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Number as SerdeNumber, Value as SerdeValue};
 
+#[cfg(test)]
+macro_rules! json {
+    ($($json:tt)+) => { $crate::otel::value::Value::from(serde_json::json!($($json)+)) };
+}
+#[cfg(test)]
+pub(crate) use json;
+
 /// An object map whose keys retain JavaScript string code units.
 pub type Object = IndexMap<JsString, Value>;
+
+/// Compatibility alias used by the attribute adapter; all logical objects use the same map.
+pub type JsonObject = Object;
 
 /// A JSON string represented as UTF-8 or canonical WTF-8 bytes.
 #[derive(Clone)]
