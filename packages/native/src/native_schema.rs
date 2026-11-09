@@ -1,6 +1,5 @@
 //! One schema for the mutable ingestion row and finalized Native row.
 
-use napi::bindgen_prelude::Object;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -71,6 +70,20 @@ macro_rules! define_row_types {
                 pub(crate) $field: logical_type!($ty $(, $logical_ty)?),
             )*
         }
+
+        impl PreparedEventRow {
+            pub(crate) fn retained_bytes(&self) -> usize {
+                std::mem::size_of::<Self>() $(+
+                    crate::native_owned::retained_size(&self.$field))*
+            }
+        }
+
+        impl OtelStorageRow {
+            pub(crate) fn retained_bytes(&self) -> usize {
+                std::mem::size_of::<Self>() $(+
+                    crate::native_owned::retained_size(&self.$field))*
+            }
+        }
     };
 }
 
@@ -129,56 +142,6 @@ macro_rules! impl_otel_row {
     };
 }
 
-macro_rules! compat_read {
-    ($object:ident, $metadata:ident, metadata_names $($rest:tt)*) => {
-        $metadata.take_names()
-    };
-    ($object:ident, $metadata:ident, metadata_values $($rest:tt)*) => {
-        $metadata.take_values()
-    };
-    (
-        $object:ident,
-        $metadata:ident,
-        $field:ident $(as $name:literal)? $(logical($logical_ty:ty))?
-        $(otel($method:ident [$($key:expr),*]))?
-        $(media_payload($payload:literal))? $(default($default:ident))?
-        : $ty:ty => $policy:expr
-    ) => {
-        crate::native_js::from_js_field::<$ty>(
-            $object,
-            column_name!($field $(as $name)?),
-            $policy,
-            &$metadata,
-        )?
-    };
-}
-
-macro_rules! impl_js_compat {
-    ($(
-        $field:ident $(as $name:literal)? $(logical($logical_ty:ty))?
-        $(otel($method:ident [$($key:expr),*]))?
-        $(media_payload($payload:literal))? $(default($default:ident))?
-        : $ty:ty => $policy:expr
-    ),* $(,)?) => {
-        impl PreparedEventRow {
-            pub(crate) fn from_js_fields(
-                object: Object<'_>,
-                mut metadata: crate::native_js::MetadataValues,
-            ) -> Result<Self, String> {
-                $(let $field = compat_read!(
-                    object,
-                    metadata,
-                    $field $(as $name)? $(logical($logical_ty))?
-                        $(otel($method [$($key),*]))?
-                        $(media_payload($payload))? $(default($default))?
-                        : $ty => $policy
-                );)*
-                Ok(Self { $($field,)* })
-            }
-        }
-    };
-}
-
 /// Columns with metadata defaults precede the metadata arrays, so conversion can
 /// resolve their defaults before taking ownership of those arrays.
 macro_rules! clickhouse_table_schema {
@@ -190,11 +153,6 @@ macro_rules! clickhouse_table_schema {
     ),* $(,)?) => {
         define_row_types! { $($field $(as $name)? $(logical($logical_ty))?: $ty,)* }
         impl_prepared_row! { $($field $(as $name)?: $ty => $policy,)* }
-        impl_js_compat! {
-            $($field $(as $name)? $(logical($logical_ty))?
-                $(otel($method [$($key),*]))?
-                $(media_payload($payload))? $(default($default))?: $ty => $policy,)*
-        }
         impl_otel_row! {
             $($field $(as $name)? $(otel($method [$($key),*]))?
                 $(media_payload($payload))? $(default($default))?: $ty => $policy,)*

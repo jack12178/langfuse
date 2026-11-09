@@ -9,6 +9,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use sha2::{Digest, Sha256};
 
+use crate::native_memory::NativeMemory;
 use crate::native_schema::OtelStorageRow;
 use crate::native_task::{to_js_error, NativeResult, OwnedTask};
 use crate::otel::{process_to_events, EventBuildConfig, OwnedEvent, StorageContext};
@@ -31,6 +32,7 @@ pub struct OtelProcessingContext {
 }
 struct Pipeline {
     source: Arc<ExtractedBatch>,
+    memory: Arc<NativeMemory>,
     rows: BatchRows,
     context: StorageContext,
     media_requests: Vec<u32>,
@@ -56,6 +58,83 @@ impl BatchRows {
 struct EnrichedStorageRow {
     row: OtelStorageRow,
     start_time_iso: String,
+}
+
+impl EnrichedStorageRow {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() - std::mem::size_of::<OtelStorageRow>()
+            + self.row.retained_bytes()
+            + self.start_time_iso.capacity()
+    }
+}
+
+impl Pipeline {
+    fn refresh_memory(&self) {
+        self.memory.resize(self.retained_bytes());
+    }
+
+    fn retained_bytes(&self) -> usize {
+        if matches!(&self.rows, BatchRows::Finalized) {
+            // Finalized rows carry the shared tracker through PreparedEvent handles.
+            return 0;
+        }
+        let rows = match &self.rows {
+            BatchRows::Prepared(rows) => {
+                rows.capacity().saturating_sub(rows.len()) * std::mem::size_of::<OwnedEvent>()
+                    + rows.iter().map(OwnedEvent::retained_bytes).sum::<usize>()
+            }
+            BatchRows::Ready(rows) => {
+                rows.capacity().saturating_sub(rows.len())
+                    * std::mem::size_of::<Option<EnrichedStorageRow>>()
+                    + rows
+                        .iter()
+                        .flatten()
+                        .map(EnrichedStorageRow::retained_bytes)
+                        .sum::<usize>()
+            }
+            BatchRows::Finalized => 0,
+        };
+        let mut media_seen = std::collections::HashSet::new();
+        let mut late_sources = HashSet::new();
+        let late_source_bytes = self
+            .late_media
+            .iter()
+            .filter_map(ExtractedMedia::source_allocation)
+            .filter(|(source, _)| late_sources.insert(*source))
+            .map(|(_, bytes)| bytes)
+            .sum::<usize>();
+        let late_media = self.late_media.capacity() * std::mem::size_of::<ExtractedMedia>()
+            + self
+                .late_media
+                .iter()
+                .map(|media| media.retained_bytes(&mut media_seen))
+                .sum::<usize>()
+            + late_source_bytes;
+        let overflow = self.overflow_requests.capacity()
+            * std::mem::size_of::<OtelOverflowRequest>()
+            + self
+                .overflow_requests
+                .iter()
+                .map(retained_overflow_request)
+                .sum::<usize>();
+        std::mem::size_of::<Self>()
+            + rows
+            + self.media_requests.capacity() * std::mem::size_of::<u32>()
+            + late_media
+            + overflow
+            + self.context.blob_storage_file_path.capacity()
+            + self.context.created_at.capacity()
+            + self.context.updated_at.capacity()
+            + self.context.event_ts.capacity()
+    }
+}
+
+fn retained_overflow_request(request: &OtelOverflowRequest) -> usize {
+    std::mem::size_of::<OtelOverflowRequest>()
+        + request.trace_id.capacity()
+        + request.observation_id.capacity()
+        + request.field.capacity()
+        + request.sha256_hash.capacity()
 }
 
 #[napi]
@@ -162,6 +241,7 @@ impl EarlyOtelBatch {
         env: Env,
         context: OtelProcessingContext,
     ) -> napi::Result<AsyncTask<OwnedTask<PreparedOtelBatch>>> {
+        let pipeline_memory = Arc::new(NativeMemory::new(&env, 0)?);
         let source = self.take_data().map_err(|error| to_js_error(env, error))?;
         Ok(AsyncTask::new(OwnedTask::new(move || {
             // Decode one resource at a time so a compact batch does not also need a full
@@ -212,6 +292,7 @@ impl EarlyOtelBatch {
                 .collect();
             let mut pipeline = Pipeline {
                 source,
+                memory: pipeline_memory,
                 rows: BatchRows::Prepared(events),
                 context: StorageContext {
                     blob_storage_file_path: context.file_key,
@@ -225,6 +306,7 @@ impl EarlyOtelBatch {
             };
             let media_requests = collect_media_requests(&mut pipeline)?;
             let lookup_requests = collect_lookup_requests(&pipeline);
+            pipeline.refresh_memory();
             let batch = RustOtelBatch {
                 state: Arc::new(Mutex::new(Some(pipeline))),
             };
@@ -280,7 +362,7 @@ impl RustOtelBatch {
         Ok(Either::A(AsyncTask::new(OwnedTask::new(move || {
             state
                 .lock()
-                .map_err(|_| failure("OTEL processing lock poisoned"))?
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
             Ok(())
         }))))
@@ -344,6 +426,7 @@ impl RustOtelBatch {
                     overflow_requests,
                 })
             } else {
+                state.refresh_memory();
                 Ok(OtelCompletion {
                     finalized: None,
                     overflow_requests,
@@ -710,7 +793,7 @@ fn finalize_inner(
         .unwrap_or_default()
         .into_iter()
         .collect::<HashSet<_>>();
-    let events = rows
+    let events: Vec<FinalizedOtelEvent> = rows
         .into_iter()
         .flatten()
         .map(|row| {
@@ -729,6 +812,7 @@ fn finalize_inner(
             Ok(FinalizedOtelEvent {
                 event: PreparedEvent {
                     row: Arc::new(prepared),
+                    memory: state.memory.clone(),
                 },
                 trace_id,
                 start_time_iso: row.start_time_iso,
@@ -736,7 +820,13 @@ fn finalize_inner(
                 serialized_event_bytes,
             })
         })
-        .collect::<NativeResult<_>>()?;
+        .collect::<NativeResult<Vec<_>>>()?;
+    state.memory.resize(
+        events
+            .iter()
+            .map(|event| event.event.row.retained_bytes())
+            .sum(),
+    );
     Ok(FinalizedOtelBatch {
         events,
         evaluation_rows,
