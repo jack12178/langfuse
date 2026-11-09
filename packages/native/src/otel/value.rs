@@ -526,6 +526,12 @@ struct BytesVisitor;
 struct FastValue(Value);
 struct FastValueVisitor;
 
+pub(super) fn deserialize_fast<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Value, D::Error> {
+    FastValue::deserialize(deserializer).map(|value| value.0)
+}
+
 impl<'de> Deserialize<'de> for FastValue {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         deserializer.deserialize_any(FastValueVisitor)
