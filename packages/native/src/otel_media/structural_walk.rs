@@ -35,7 +35,7 @@ use super::payload::{EarlyMediaError, MediaPayloadKind};
 use super::provider_shapes::{structured_shape, ProviderFields, ShapeKey, ValueShape};
 use super::rules::{
     is_otel_envelope_field, is_tag_attribute, may_contain_media_candidate,
-    media_scan_mode_for_field, MediaScanMode, MIN_EARLY_MEDIA_BYTES,
+    media_scan_mode_for_field, MediaScanMode,
 };
 use super::WalkStats;
 
@@ -124,16 +124,23 @@ impl<'a> ObjectFrame<'a> {
 struct StructuralWalk<'a, 'stats> {
     input: &'a [u8],
     allow_envelope: bool,
+    min_candidate_bytes: usize,
     stats: &'stats mut WalkStats,
     candidates: Vec<PendingCandidate>,
     mask_operations: Vec<MaskOperation>,
 }
 
 impl<'a, 'stats> StructuralWalk<'a, 'stats> {
-    fn new(input: &'a [u8], allow_envelope: bool, stats: &'stats mut WalkStats) -> Self {
+    fn new(
+        input: &'a [u8],
+        allow_envelope: bool,
+        min_candidate_bytes: usize,
+        stats: &'stats mut WalkStats,
+    ) -> Self {
         Self {
             input,
             allow_envelope,
+            min_candidate_bytes,
             stats,
             candidates: Vec::new(),
             mask_operations: Vec::new(),
@@ -332,7 +339,7 @@ impl<'a, 'stats> StructuralWalk<'a, 'stats> {
     fn record_string(&mut self, range: Range<usize>, mask: u8, text_only: bool) {
         let raw = &self.input[range.start + 1..range.end - 1];
         self.stats.add_bytes(raw.len());
-        if mask != 0 && raw.len() >= MIN_EARLY_MEDIA_BYTES && may_contain_media_candidate(raw) {
+        if mask != 0 && raw.len() >= self.min_candidate_bytes && may_contain_media_candidate(raw) {
             self.candidates.push(PendingCandidate {
                 mask,
                 candidate: if text_only {
@@ -500,9 +507,10 @@ fn apply_mask_operations(
 pub(super) fn scan(
     input: &[u8],
     allow_envelope: bool,
+    min_candidate_bytes: usize,
     stats: &mut WalkStats,
 ) -> Result<impl Iterator<Item = Candidate>, EarlyMediaError> {
-    let mut walk = StructuralWalk::new(input, allow_envelope, stats);
+    let mut walk = StructuralWalk::new(input, allow_envelope, min_candidate_bytes, stats);
     let root_end = walk.run()?;
     let trailing_bytes = skip_whitespace(input, root_end);
     if trailing_bytes != input.len() {

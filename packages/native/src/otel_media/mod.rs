@@ -45,14 +45,19 @@
 //! ranges keep the source alive through `Arc`, or own a detached copy (see `payload`).
 //! `otel_input` owns that result behind N-API handles; consumers perform uploads later.
 
+use std::collections::HashSet;
+
 mod data_uri;
 mod encoding;
 mod json;
 mod json_cursor;
+mod legacy;
+mod normalized;
 mod payload;
 mod provider_shapes;
 mod rules;
 mod scanner;
+mod source_text;
 mod structural_walk;
 
 /// Test counters for traversal scaling, not production telemetry. Outside tests,
@@ -88,8 +93,65 @@ impl WalkStats {
     }
 }
 
+pub use legacy::MediaReferenceCollector;
+pub use normalized::extract_normalized_media;
+pub use payload::EarlyMediaError;
 pub use payload::{validate, EarlyMediaResult, ExtractedMedia, ValidatedPayload};
 pub(crate) use rules::may_contain_media_candidate;
+pub use source_text::rewrite_known_references;
+
+use scanner::MAX_EMBEDDED_JSON_DEPTH;
+
+const MAX_LEGACY_MEDIA_DEPTH: usize = 10;
+
+/// Run extraction for a JSON value nested in an already parsed string. The
+/// caller supplies the inherited string depth so the embedded-document limit
+/// cannot be reset by normalization.
+pub(crate) fn extract_media_at_depth(
+    input: &[u8],
+    embedded_depth: usize,
+    min_candidate_bytes: usize,
+) -> Result<EarlyMediaResult, EarlyMediaError> {
+    let text = std::str::from_utf8(input).map_err(|error| EarlyMediaError::InvalidJson {
+        offset: error.valid_up_to(),
+        message: "invalid UTF-8",
+    })?;
+    json::validate_json(text)?;
+    let mut manifest = scanner::discover_at_depth(text, embedded_depth, min_candidate_bytes)?;
+    // The inherited depth limits discovery, but compaction removes one escape
+    // layer from this source. Retained spelling and upload decoding therefore
+    // count layers relative to this document, not its former outer wrappers.
+    for entry in &mut manifest.entries {
+        entry.original_json_depth -= embedded_depth as u8;
+        entry.json_decode_layers = entry
+            .json_decode_layers
+            .saturating_sub(embedded_depth as u8);
+    }
+    payload::compact_manifest(text, manifest)
+}
+
+/// Collect temporary references from values without treating object keys as payloads.
+pub fn collect_media_references(value: &str, references: &mut HashSet<String>) {
+    source_text::for_each_media_reference(value, |reference| {
+        references.insert(reference.to_owned());
+    });
+}
+
+/// Ensure every extracted occurrence has its own temporary reference. Metadata
+/// may be shared by content hash, but restoration must remain occurrence-specific.
+pub fn validate_media_registry(
+    existing: &[ExtractedMedia],
+    additions: &[ExtractedMedia],
+) -> Result<(), EarlyMediaError> {
+    let mut references = HashSet::new();
+    for media in existing.iter().chain(additions) {
+        let reference = media.reference();
+        if !references.insert(reference.clone()) {
+            return Err(EarlyMediaError::UnsupportedMediaReferenceAmbiguity { reference });
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 pub fn extract_media(input: &[u8]) -> Result<EarlyMediaResult, payload::EarlyMediaError> {

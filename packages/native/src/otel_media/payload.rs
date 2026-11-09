@@ -131,14 +131,14 @@ pub struct ExtractedMedia {
     pub kind: MediaPayloadKind,
     pub encoding: MediaEncoding,
     /// Source spelling after parsing the outer JSON, retaining any nested escapes.
-    storage: MediaStorage,
+    pub(super) storage: MediaStorage,
     /// Remaining JSON unescapes needed to reach media text. Zero when the stored
     /// spelling already matches, even if the candidate was in an embedded document.
     json_decode_layers: u8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum MediaStorage {
+pub(super) enum MediaStorage {
     Owned(Vec<u8>),
     Source {
         bytes: Arc<String>,
@@ -147,6 +147,36 @@ enum MediaStorage {
 }
 
 impl ExtractedMedia {
+    /// Build a late-discovered occurrence from an owned encoded representation.
+    pub(crate) fn from_owned(
+        encoded: Vec<u8>,
+        content_type: &str,
+        kind: MediaPayloadKind,
+        source: MediaSource,
+        encoding: MediaEncoding,
+    ) -> Result<Option<Self>, EarlyMediaError> {
+        let Some((_reference, sha256_hash)) =
+            super::scanner::media_identity_from_encoded(&encoded, content_type, source, encoding)
+        else {
+            return Ok(None);
+        };
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(|_| EarlyMediaError::RandomnessUnavailable)?;
+        Ok(Some(Self {
+            metadata: Arc::new(MediaMetadata {
+                source,
+                content_type: content_type.to_owned(),
+                sha256_hash,
+            }),
+            occurrence_id: u128::from_le_bytes(nonce),
+            original_json_depth: 0,
+            kind,
+            encoding,
+            storage: MediaStorage::Owned(encoded),
+            json_decode_layers: 0,
+        }))
+    }
+
     /// Temporary identity travels with this occurrence through normalization.
     /// Upload deduplication uses the separate content hash.
     pub fn reference(&self) -> String {
@@ -384,6 +414,9 @@ pub enum EarlyMediaError {
     InvalidEditPlan {
         entry: usize,
     },
+    UnsupportedMediaReferenceAmbiguity {
+        reference: String,
+    },
     RandomnessUnavailable,
 }
 
@@ -394,6 +427,9 @@ impl fmt::Display for EarlyMediaError {
                 write!(f, "invalid JSON at byte {offset}: {message}")
             }
             Self::TrailingBytes { offset } => write!(f, "trailing JSON bytes at byte {offset}"),
+            Self::UnsupportedMediaReferenceAmbiguity { reference } => {
+                write!(f, "media reference {reference} is ambiguous")
+            }
             Self::RandomnessUnavailable => f.write_str("could not create temporary media identity"),
             Self::InvalidEditPlan { entry } => {
                 write!(
@@ -411,7 +447,9 @@ impl EarlyMediaError {
     /// Stable error codes exposed through N-API.
     pub fn code(&self) -> &'static str {
         match self {
-            Self::InvalidEditPlan { .. } | Self::RandomnessUnavailable => "ERR_OTEL_INTERNAL",
+            Self::InvalidEditPlan { .. }
+            | Self::RandomnessUnavailable
+            | Self::UnsupportedMediaReferenceAmbiguity { .. } => "ERR_OTEL_INTERNAL",
             Self::InvalidJson { .. } | Self::TrailingBytes { .. } => "ERR_OTEL_INVALID_JSON",
         }
     }
@@ -507,6 +545,14 @@ fn apply_edit_plan(
         compact_json,
         media,
     })
+}
+
+/// Apply a manifest discovered in a nested string while preserving the caller's depth budget.
+pub(super) fn compact_manifest(
+    input: &str,
+    manifest: MediaManifest,
+) -> Result<EarlyMediaResult, EarlyMediaError> {
+    apply_edit_plan(Arc::new(input.to_owned()), manifest)
 }
 
 const MAX_JSON_LAYER_ADJUSTMENT: u32 = 16;
