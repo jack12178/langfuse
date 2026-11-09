@@ -5,7 +5,7 @@ import fc, { type Arbitrary } from "fast-check";
 import { describe, expect, it } from "vitest";
 import type { ResourceSpan } from "@langfuse/shared/src/server";
 import {
-  expectRawOtelReplayParity,
+  expectRawNativeParity,
   runOtelReplayComparison,
 } from "./helpers/otelReplayHarness";
 import {
@@ -625,6 +625,9 @@ const directedCases: ReplayCase[] = [
         traceAttributes: [
           { key: "route.status", value: { kind: "string", value: "trace" } },
         ],
+        version: "",
+        release: "",
+        environment: "empty",
       },
     ],
   },
@@ -662,7 +665,11 @@ async function assertReplayPersists(params: ReplayCase): Promise<void> {
     mediaUploadEnabled: true,
   });
 
-  for (const result of [comparison.originalTs, comparison.earlyTs]) {
+  for (const result of [
+    comparison.originalTs,
+    comparison.earlyTs,
+    comparison.earlyRust,
+  ]) {
     expect(result.storedRows, result.mode).toHaveLength(
       replay.expectedRows.length,
     );
@@ -685,7 +692,7 @@ async function assertReplayPersists(params: ReplayCase): Promise<void> {
     }
   }
 
-  expectRawOtelReplayParity(comparison);
+  expectRawNativeParity(comparison);
 }
 
 // The replay writer retries internally; Vitest retries could overlap an

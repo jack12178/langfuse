@@ -1,6 +1,7 @@
 import {
   extractOtelMedia,
   hasOtelMediaCandidate,
+  prepareOtelJson,
   validateOtelJson,
   type EarlyOtelBatch,
   type ValidatedOtelJson,
@@ -39,8 +40,10 @@ export async function prepareOtelBatch(params: {
   orgId?: string;
   propagatedHeaders?: Record<string, string>;
   extractMedia: boolean;
+  /** Keep owned JSON for native normalization even when no media is present. */
+  retainNativeBatch?: boolean;
 }): Promise<PreparedInput> {
-  const { bytes, extractMedia, ...context } = params;
+  const { bytes, extractMedia, retainNativeBatch = false, ...context } = params;
   const startedAt = performance.now();
   let outcome: "native" | "unchanged" | "masking_drop" | "error" = "error";
   let codepath: "inline_check" | "uv_dispatch" | "disabled" = "disabled";
@@ -48,6 +51,12 @@ export async function prepareOtelBatch(params: {
   let maskedInput: ValidatedOtelJson | undefined;
   try {
     if (!isIngestionMaskingEnabled()) {
+      if (retainNativeBatch) {
+        codepath = "uv_dispatch";
+        const batch = await prepareOtelJson(bytes, extractMedia);
+        outcome = "native";
+        return { batch, sourceUnchanged: false };
+      }
       codepath = extractMedia ? "inline_check" : "disabled";
       const inputStartedAt = performance.now();
       const needsExtraction =
