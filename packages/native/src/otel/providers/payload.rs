@@ -22,7 +22,7 @@ const SDK_IO: [[&str; 2]; 2] = [
     ["langfuse.trace.input", "langfuse.trace.output"],
     ["langfuse.observation.input", "langfuse.observation.output"],
 ];
-const GENKIT_IO: [&str; 2] = ["genkit:input", "genkit:output"];
+pub(super) const GENKIT_IO: [&str; 2] = ["genkit:input", "genkit:output"];
 const AI_INPUT_KEYS: &[&str] = &["ai.prompt.messages", "ai.prompt", "ai.toolCall.args"];
 const AI_OUTPUT_KEYS: &[&str] = &[
     "ai.response.text",
@@ -48,7 +48,7 @@ const FLUE_IO: [&[&str]; 2] = [
         "flue.workflow.result",
     ],
 ];
-const VERTEX_IO: [[&str; 2]; 2] = [
+pub(super) const VERTEX_IO: [[&str; 2]; 2] = [
     [
         "gcp.vertex.agent.llm_request",
         "gcp.vertex.agent.llm_response",
