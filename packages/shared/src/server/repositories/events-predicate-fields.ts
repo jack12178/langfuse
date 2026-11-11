@@ -70,14 +70,26 @@ type Lowered<T> = (eb: EventsExpressionBuilder) => Expression<T>;
 export type ScalarFieldLowering =
   | (ScalarFacts &
       StringIndexFacts & { kind: "string"; value: Lowered<string> })
-  | KindedLowering<"nullableString">
+  | (KindedLowering<"nullableString"> & GuardedNonEmptyFacts)
   | KindedLowering<"array">
   | KindedLowering<"scalar">;
+
+/**
+ * For a `nullableString` value that is `if(guard, nullIf(value, ''), NULL)`:
+ * `=` and `any of` on non-empty values compare as `guard AND value = v` /
+ * `guard AND value IN (…)`, the same rows in the plain comparison shape that
+ * events routing reads, so a short metadata lookup stays on `events_core`.
+ */
+type GuardedNonEmptyFacts = {
+  guarded?: { guard: Lowered<SqlBool>; value: Lowered<string> };
+};
 
 /** Value type of each kind without index facts. */
 type ValueOfKind = {
   nullableString: string | null;
-  array: string[];
+  // Elements may be NULL: tuple fields of `Array(Tuple(…))` columns can be
+  // `Nullable(String)`.
+  array: Array<string | null>;
   scalar: unknown;
 };
 

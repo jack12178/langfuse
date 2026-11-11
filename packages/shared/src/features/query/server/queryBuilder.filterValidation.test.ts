@@ -130,7 +130,7 @@ describe("queryBuilder filter type validation", () => {
         version,
       );
 
-      expect(query).toContain("prompt_version = {numberFilter");
+      expect(query).toMatch(/prompt_version = \{\w+: ?Decimal64\(12\)\}/);
     },
   );
 
@@ -357,13 +357,11 @@ describe("queryBuilder filter type validation", () => {
     );
 
     expect(evaluatorIdQuery.query).toContain(
-      "coalesce(nullIf(events_observations.evaluator_id, ''), events_observations.evaluation_rule_id)",
+      "coalesce(nullIf(e.evaluator_id, ''), e.evaluation_rule_id)",
     );
-    expect(evaluatorTestQuery.query).toContain(
-      "events_observations.evaluator_execution_is_test",
-    );
+    expect(evaluatorTestQuery.query).toContain("e.evaluator_execution_is_test");
     expect(evaluatorIdQuery.query).toContain("!= ''");
-    expect(evaluatorTestQuery.query).toContain(": Boolean}");
+    expect(evaluatorTestQuery.query).toContain(":Boolean}");
   });
 
   it("lowers the semantic-root observation filter only in the v2 events view", async () => {
@@ -378,10 +376,9 @@ describe("queryBuilder filter type validation", () => {
       "v2",
     );
 
-    expect(query).toContain(
-      "toBool((events_observations.parent_span_id = '' OR events_observations.is_app_root = true)) = {booleanFilter",
+    expect(query).toMatch(
+      /toBool\(\(e\.parent_span_id = '' or e\.is_app_root = true\)\) = \{\w+:Boolean\}/,
     );
-    expect(query).toContain(": Boolean}");
 
     await expect(
       buildQueryWithFilter(
@@ -395,6 +392,20 @@ describe("queryBuilder filter type validation", () => {
         "v1",
       ),
     ).rejects.toThrow(/Invalid filter column isRootObservation/);
+  });
+
+  it("rejects a column that is no dimension of the v2 observations view", async () => {
+    await expect(
+      buildQueryWithFilter(
+        { column: "notAColumn", operator: "=", value: "x", type: "string" },
+        undefined,
+        "v2",
+      ),
+    ).rejects.toThrow(
+      new InvalidRequestError(
+        `Invalid filter column notAColumn. Must be one of ${Object.keys(getViewDeclaration("observations", "v2").dimensions)} or start_time`,
+      ),
+    );
   });
 });
 
@@ -620,15 +631,13 @@ describe("toolCallInvocations measure", () => {
     );
 
     expect(compiledQuery).toContain(
-      "arrayJoin(arrayDistinct(events_observations.tool_call_names)) as calledToolNames",
+      "arrayJoin(arrayDistinct(e.tool_call_names)) as calledToolNames",
     );
     expect(compiledQuery).toContain(
-      "sum(countEqual((events_observations.tool_call_names), calledToolNames))",
+      "sum(countEqual(e.tool_call_names, calledToolNames))",
     );
-    expect(compiledQuery).not.toContain(
-      "any(events_observations.tool_call_names)",
-    );
-    expect(compiledQuery.match(/\bSELECT\b/g)).toHaveLength(1);
+    expect(compiledQuery).not.toContain("any(e.tool_call_names)");
+    expect(compiledQuery.match(/\bselect\b/gi)).toHaveLength(1);
   });
 
   it("honors a stored count aggregation instead of the UI default sum", async () => {

@@ -242,7 +242,34 @@ function lowerCondition(
   eb: EventsExpressionBuilder,
   condition: PredicateCondition,
 ): Condition[] {
-  const { lowering } = resolveCondition(condition);
+  return lowerFieldCondition(
+    eb,
+    resolveCondition(condition).lowering,
+    condition,
+  );
+}
+
+/**
+ * `condition` as conjuncts over `e`, comparing the value `lowering` gives;
+ * `condition.field.id` is not looked up. For a host whose fields have their
+ * own lowerings (the dashboard observations view), which checks that a
+ * field takes the condition's type and operator. A type the lowering's value
+ * kind does not take throws `QueryCompileError`, as do the condition types no
+ * lowering takes (`categoryOptions`, `booleanObject`, `positionInTrace`, …).
+ */
+export const lowerEventsFieldCondition = scopedToEvents(
+  (
+    eb,
+    lowering: EventsFieldLowering,
+    condition: PredicateCondition,
+  ): Condition[] => lowerFieldCondition(eb, lowering, condition),
+);
+
+function lowerFieldCondition(
+  eb: EventsExpressionBuilder,
+  lowering: EventsFieldLowering,
+  condition: PredicateCondition,
+): Condition[] {
   if (lowering.kind === "metadata") {
     return lowerMetadataCondition(eb, condition);
   }
@@ -385,6 +412,11 @@ function lowerString(
 
   switch (op) {
     case "=": {
+      const guarded =
+        lowering.kind === "nullableString" ? lowering.guarded : undefined;
+      if (guarded && search !== "") {
+        return [eb.and([guarded.guard(eb), eb(guarded.value(eb), "=", bound)])];
+      }
       const exact = eb(value, "=", bound);
       if (indexed?.textIndexed) {
         return [
@@ -445,6 +477,15 @@ function lowerStringOptions(
   const value = lowering.value(eb);
   const list = inList(eb, values);
   const hasEmpty = lowering.emptyEqualsNull && values.includes("");
+  if (
+    op === "any of" &&
+    lowering.kind === "nullableString" &&
+    lowering.guarded &&
+    !values.includes("")
+  ) {
+    const { guard, value: guardedValue } = lowering.guarded;
+    return eb.and([guard(eb), eb(guardedValue(eb), "in", list)]);
+  }
   if (op === "any of") {
     const listed = eb(value, "in", list);
     const matched =
@@ -472,7 +513,7 @@ function lowerStringOptions(
 
 function lowerArrayOptions(
   eb: EventsExpressionBuilder,
-  array: Expression<string[]>,
+  array: Expression<Array<string | null>>,
   { op, value: values }: ConditionOf<"arrayOptions">,
 ): Condition {
   const list = typedValue<string[]>(values, STRING_ARRAY);

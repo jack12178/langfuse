@@ -24,10 +24,12 @@ import {
   aggregationSlot,
   eventsObservationsScoresJoin,
 } from "./eventsObservationsRegistry";
+import { isNgramSubstringTarget } from "../../../server/queries/clickhouse-sql/fts";
 import { NULL_IF_EMPTY_RE } from "./nullIfEmptyFilter";
 
 // select … from events_truncated as e left join scores on <join>
-// (`events_truncated` always routes to `events_core`, the view's `baseCte`)
+// (with no WHERE filter, `events_truncated` routes to `events_core`, the
+// view's `baseCte`)
 const baseQuery = () =>
   getClickhouseKysely()
     .selectFrom("events_truncated as e")
@@ -82,11 +84,12 @@ function registryCases(): Case[] {
       legacy: legacy.sql,
       build: (eb) => entry.expression(eb),
     });
-    if ("pairExpand" in entry) {
+    const pairExpand = "pairExpand" in entry ? entry.pairExpand : undefined;
+    if (pairExpand) {
       cases.push({
         key: `pair_values_${name}`,
         legacy: legacy.pairExpand?.valuesSql ?? "missing_pair_expand",
-        build: (eb) => entry.pairExpand.values(eb),
+        build: (eb) => pairExpand.values(eb),
       });
     }
   }
@@ -153,9 +156,26 @@ describe("v2 observations registry", () => {
       EVENTS_OBSERVATIONS_DIMENSIONS,
     )) {
       expect(
-        "pairExpand" in entry ? entry.pairExpand.valueAlias : undefined,
+        "pairExpand" in entry ? entry.pairExpand?.valueAlias : undefined,
         name,
       ).toEqual(view.dimensions[name].pairExpand?.valueAlias);
+    }
+  });
+
+  it("types every exploded or pair-expanded dimension as an array, and lowers a filter for every other", () => {
+    for (const [name, entry] of Object.entries(
+      EVENTS_OBSERVATIONS_DIMENSIONS,
+    )) {
+      const { explodeArray, pairExpand } = view.dimensions[name];
+      expect(
+        {
+          array: explodeArray || pairExpand ? entry.array : true,
+          filter: pairExpand
+            ? true
+            : "filter" in entry && entry.filter !== undefined,
+        },
+        name,
+      ).toEqual({ array: true, filter: true });
     }
   });
 
@@ -167,6 +187,42 @@ describe("v2 observations registry", () => {
       expect(match?.[1], name).toEqual(
         legacyMatch?.[1].replace(`${LEGACY_ALIAS}.`, "e."),
       );
+    }
+  });
+
+  // The string builder's `mapFilters` compares the column inside a
+  // `nullIf(column, '')` dimension with `''` and NULL as one value, any other
+  // dimension as its `sql`, and adds the ngram conjunct by column name.
+  it("lowers each dimension's filter as the string builder's mapFilters does", () => {
+    const eb: QueryBuilder = expressionBuilder(baseQuery());
+    const rendered = renderCases(registryCases());
+    for (const [name, entry] of Object.entries(
+      EVENTS_OBSERVATIONS_DIMENSIONS,
+    )) {
+      const filter = "filter" in entry ? entry.filter : undefined;
+      if (!filter) continue;
+      const legacyColumn = NULL_IF_EMPTY_RE.exec(
+        view.dimensions[name].sql,
+      )?.[1];
+      const registryValue = rendered[`dimension_${name}`];
+      expect(
+        {
+          emptyEqualsNull: filter.emptyEqualsNull ?? false,
+          ngramIndexed:
+            filter.kind === "string" ? (filter.ngramIndexed ?? false) : false,
+          value: renderClickhouseExpression(filter.value(eb)),
+        },
+        name,
+      ).toEqual({
+        emptyEqualsNull: legacyColumn !== undefined,
+        ngramIndexed: isNgramSubstringTarget(
+          "events_core",
+          legacyColumn ?? view.dimensions[name].sql,
+        ),
+        value: legacyColumn
+          ? NULL_IF_EMPTY_RE.exec(registryValue)?.[1]
+          : registryValue,
+      });
     }
   });
 
